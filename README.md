@@ -334,7 +334,17 @@ Copy and edit the following - update `RCON_PASS` and paths to match your setup, 
             s.settimeout(5)
             s.connect((ip, int(port)))
             s.sendall(struct.pack('<3i', 10 + len(password), 1, 3) + password.encode('utf-8') + b'\x00\x00')
-            s.recv(4096)
+            auth_resp = s.recv(4096)
+            # Source RCON protocol: the auth response's Request ID field
+            # (bytes 4:8) is -1 on failed authentication. Without this
+            # check, a wrong password never raises an exception - it just
+            # silently proceeds to send the command over an unauthenticated
+            # connection, and every command from then on is a no-op.
+            auth_id = struct.unpack('<i', auth_resp[4:8])[0]
+            if auth_id == -1:
+                print('RCON_AUTH_FAILED')
+                s.close()
+                return
             s.sendall(struct.pack('<3i', 10 + len(cmd), 2, 2) + cmd.encode('utf-8') + b'\x00\x00')
             res = s.recv(4096)
             s.close()
@@ -352,17 +362,24 @@ Copy and edit the following - update `RCON_PASS` and paths to match your setup, 
         if /usr/bin/screen -list | grep -q "\.${INSTANCE_NAME}[[:space:]]"; then
             log "Active ${INSTANCE_NAME} session discovered. Initializing graceful countdown..."
 
-            send_rcon "broadcast Server shutting down in 5 minutes! Please prepare."
-            sleep 120
-            send_rcon "broadcast Server shutting down in 3 minutes! Find a safe spot."
-            sleep 120
-            send_rcon "broadcast Server shutting down in 60 seconds! Please log out."
-            sleep 30
-            send_rcon "broadcast Server shutting down in 30 seconds!"
-            sleep 20
+            # Verify auth actually succeeds before committing to the full
+            # 5-minute countdown - if RCON_PASS is wrong, every subsequent
+            # call would silently no-op anyway, so there's no point waiting.
+            FIRST_RCON_RESULT=$(send_rcon "broadcast Server shutting down in 5 minutes! Please prepare.")
+            if echo "$FIRST_RCON_RESULT" | grep -q "RCON_AUTH_FAILED"; then
+                log "CRITICAL: RCON authentication failed (check RCON_PASS). Skipping RCON entirely and going straight to signal-based termination."
+            else
+                sleep 120
+                send_rcon "broadcast Server shutting down in 3 minutes! Find a safe spot."
+                sleep 120
+                send_rcon "broadcast Server shutting down in 60 seconds! Please log out."
+                sleep 30
+                send_rcon "broadcast Server shutting down in 30 seconds!"
+                sleep 20
 
-            log "Sending RCON shutdown command..."
-            send_rcon "shutdown"
+                log "Sending RCON shutdown command..."
+                send_rcon "shutdown"
+            fi
 
             # --- VERIFY THE ACTUAL PROCESS EXITS ---
             # RCON accepting the command doesn't guarantee the process
@@ -770,10 +787,14 @@ By default, `start_server.sh`, `stop_server.sh`, and `update_checker.sh` are own
 > [!Important]
 > Lock down both the **directory** and the **files**. Locking only the files isn't enough - if the directory itself is still writable, an attacker can delete and recreate a script even without write access to its contents.
 
+> [!Caution]
+> **This protects against tampering, not against credential exposure.** `750` still gives `your_username` group read access - the same account can `cat stop_server.sh` and read `RCON_PASS` in plaintext, since the game process itself needs that same credential to authenticate over RCON. This is somewhat structurally unavoidable in this design: the account running the game inherently must be able to read what it authenticates with. If a compromised game process reading its own RCON password (rather than modifying scripts) is a threat you specifically care about, that needs a different privilege model entirely - e.g. a helper process with access `your_username` lacks - which is real added complexity most homelab setups don't need. This step solves one problem, not both.
+
 ## Sandbox the systemd Service
 
 Add the following under `[Service]` in `/etc/systemd/system/ConanExiles.service` (Step 10):
 
+    Environment="SCREENDIR=/home/your_username/.screen"
     NoNewPrivileges=true
     PrivateTmp=true
     ProtectSystem=strict
@@ -781,13 +802,20 @@ Add the following under `[Service]` in `/etc/systemd/system/ConanExiles.service`
     ReadWritePaths=/home/your_username/conan_server
     ReadWritePaths=/home/your_username/.run
     ReadWritePaths=/home/your_username/.flock
+    ReadWritePaths=/home/your_username/.screen
     ReadWritePaths=/home/your_username/.logs
     ReadWritePaths=/home/your_username/.backups
     ReadWritePaths=/home/your_username/downloads
     ReadWritePaths=/home/your_username/.local/share/Steam
 
+Create the directory and make sure any manual/interactive `screen` sessions use the same location, or `screen -list` won't see sessions started under the unit and vice versa:
+
+    mkdir -p /home/your_username/.screen
+    chmod 700 /home/your_username/.screen
+    export SCREENDIR=/home/your_username/.screen   # add this to your shell profile too
+
 > [!Caution]
-> `ProtectSystem=strict` and `ProtectHome=read-only` make essentially the entire filesystem read-only to this service by default - every path it needs to write to must be listed explicitly, or the write fails silently and something breaks (most likely the SteamCMD update, the Workshop mod download/sync step, or the backup/log/PID-file writes). `/home/your_username/downloads` above is where Workshop mods are staged before being copied into `Mods/` - easy to forget since it's only used mid-script. If you installed SteamCMD differently, confirm its actual cache path first.
+> `ProtectSystem=strict` and `ProtectHome=read-only` make essentially the entire filesystem read-only to this service by default - every path it needs to write to must be listed explicitly, or the write fails silently and something breaks (most likely the SteamCMD update, the Workshop mod download/sync step, or the backup/log/PID-file writes). `/home/your_username/downloads` above is where Workshop mods are staged before being copied into `Mods/` - easy to forget since it's only used mid-script. **`screen`'s own socket directory is the single most likely thing to break on first deploy** if left unaddressed: its default location (often `/run/screen`, distro-dependent) isn't included in this sandbox at all, and `screen -dmS` failing to create its socket fails silently. Pinning `SCREENDIR` explicitly, as done above, removes the guesswork. If you installed SteamCMD differently, confirm its actual cache path too.
 
 **Test before trusting this in production** - reload, restart, and watch a full update-and-mod-sync cycle complete successfully before considering this done:
 
