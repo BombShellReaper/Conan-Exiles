@@ -96,7 +96,8 @@ Unlike some games, Conan Exiles doesn't have a settings file toggle for RCON - i
 
 Start the server once manually to confirm it boots (`./ConanSandboxServer.sh -log -RconEnabled=1 -RconPassword=your_rcon_password -RconPort=25575`), then from another terminal, ask the server itself what it actually supports:
 
-    python3 -c "
+```bash
+python3 -c "
 import socket, struct
 def run_cmd(ip, port, password, cmd):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -110,6 +111,7 @@ def run_cmd(ip, port, password, cmd):
     print(res)
 run_cmd('127.0.0.1', '25575', 'your_rcon_password', 'help')
 "
+```
 
 This should return a byte string listing every command your build actually supports. On the build this guide was validated against, the real graceful-shutdown command turned out to be `shutdown` (not `quit`, and there is no separate `save` command - `shutdown` handles flushing world data as part of its own sequence). **Confirm what your own server returns before relying on the stop script in Step 8**, and adjust the commands it sends if your build's list differs.
 
@@ -325,22 +327,22 @@ Copy and edit the following - update `RCON_PASS` and paths to match your setup, 
     send_rcon() {
         local command_text="$1"
         python3 -c "
-import socket, struct
-def run_cmd(ip, port, password, cmd):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
-        s.connect((ip, int(port)))
-        s.sendall(struct.pack('<3i', 10 + len(password), 1, 3) + password.encode('utf-8') + b'\x00\x00')
-        s.recv(4096)
-        s.sendall(struct.pack('<3i', 10 + len(cmd), 2, 2) + cmd.encode('utf-8') + b'\x00\x00')
-        res = s.recv(4096)
-        s.close()
-        return res
-    except Exception as e:
-        print(f'RCON Error: {e}')
-run_cmd('$RCON_IP', '$RCON_PORT', '$RCON_PASS', '$command_text')
-"
+    import socket, struct
+    def run_cmd(ip, port, password, cmd):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect((ip, int(port)))
+            s.sendall(struct.pack('<3i', 10 + len(password), 1, 3) + password.encode('utf-8') + b'\x00\x00')
+            s.recv(4096)
+            s.sendall(struct.pack('<3i', 10 + len(cmd), 2, 2) + cmd.encode('utf-8') + b'\x00\x00')
+            res = s.recv(4096)
+            s.close()
+            return res
+        except Exception as e:
+            print(f'RCON Error: {e}')
+    run_cmd('$RCON_IP', '$RCON_PORT', '$RCON_PASS', '$command_text')
+    "
     }
 
     {
