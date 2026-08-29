@@ -144,6 +144,8 @@ Copy and edit the following - update `DIRPATH`, `ADMIN_PASSWORD`, `RCON_PASSWORD
     ADMIN_PASSWORD="your_admin_password"
     RCON_PASSWORD="your_rcon_password"
 
+    export SCREENDIR="/home/your_username/.screen"
+
     mkdir -p "$LOG_DIR"
     mkdir -p "$BACKUP_DIR"
     mkdir -p "$PID_DIR"
@@ -318,6 +320,8 @@ Copy and edit the following - update `RCON_PASS` and paths to match your setup, 
     PID_DIR="/home/your_username/.run"
     PID_FILE="$PID_DIR/conanserver.pid"
 
+    export SCREENDIR="/home/your_username/.screen"
+
     mkdir -p "$LOG_DIR"
 
     log() {
@@ -454,6 +458,8 @@ Copy and edit the following, updating paths and `WEBHOOK_URL` (optional) to matc
     IMAGE_URL=""
     DISCORD_FOOTER="Server Maintenance Automation"
 
+    export SCREENDIR="/home/your_username/.screen"
+
     VERSION_FILE="$SERVER_DIR/current_version.txt"
     MANIFEST_FILE="$SERVER_DIR/steamapps/appmanifest_${STEAM_APP_ID}.acf"
     FULL_LOG_PATH="$LOG_DIR/$LOG_FILE"
@@ -589,7 +595,7 @@ Add:
 
     sudo nano /etc/systemd/system/ConanExiles.service
 
-**Add the following configuration** - replace `your_username` throughout:
+**Base configuration** - replace `your_username` throughout:
 
     [Unit]
     Description=Your Conan Exiles Dedicated Server
@@ -601,6 +607,7 @@ Add:
     [Service]
     Type=forking
     User=your_username
+    Group=your_username
     WorkingDirectory=/home/your_username
     ExecStart=/home/your_username/.scripts/start_server.sh
     ExecStop=/home/your_username/.scripts/stop_server.sh
@@ -611,24 +618,74 @@ Add:
     TimeoutStopSec=420
     Restart=always
     RestartSec=60
+    StandardOutput=journal
+    StandardError=journal
 
     [Install]
     WantedBy=multi-user.target
 
 > [!Important]
-> **`Restart=always`, not `Restart=on-failure`, matters more here than it might look.** This was found via a real, reproduced incident: `on-failure` does **not** treat a clean `SIGINT`-terminated exit as a failure - which is exactly how this stop script's SIGINT fallback (used whenever `shutdown` doesn't finish inside its wait window) terminates the process. Under `on-failure`, a completely normal graceful stop can silently fail to trigger systemd's own auto-restart, with only the update checker's own manual-start fallback catching it - producing a "Maintenance Failed" alert for something that wasn't actually a failure. `Restart=always` removes this dependency on *which signal* killed the process entirely.
->
-> **`RestartSec=60`, `TimeoutStartSec=300`, `TimeoutStopSec=420`** were sized from real measured runtimes on a production server (not estimated): a typical start (backup + update + mod sync + launch + PID verify) completed in ~100-120 seconds, and a full graceful stop (5-minute countdown + shutdown + fallback) completed in ~300-330 seconds. These numbers give real margin above both without being wastefully large - tighten or loosen them based on your own measured logs once you've run a few real cycles.
->
-> **`StartLimitIntervalSec=600` / `StartLimitBurst=2`** caps systemd to 2 restart attempts in any 10-minute window before giving up and marking the unit `failed`, rather than retrying forever if something is genuinely broken. A single update cycle only ever counts as one restart, so this shouldn't fire during normal operation.
+> `Restart=always`, not `on-failure` - `on-failure` doesn't count a `SIGINT`-terminated exit (the stop script's own fallback) as a failure, so it can silently skip auto-restart. Confirmed via a real reproduced incident.
 
-**Enable and Start the Service**
+> [!Note]
+> `RestartSec=60`/`TimeoutStartSec=300`/`TimeoutStopSec=420` are sized from real measured runtimes (~100-120s start, ~300-330s stop) - adjust based on your own logs.
+
+> [!Note]
+> `StartLimitIntervalSec=600`/`StartLimitBurst=2` caps retries to 2 per 10 minutes before marking the unit `failed`.
+
+**Enable, start, and confirm before moving on:**
 
     sudo systemctl daemon-reload
     sudo systemctl enable ConanExiles.service
     sudo systemctl start ConanExiles.service
     sudo systemctl status ConanExiles.service
     cat /home/your_username/.run/conanserver.pid
+
+--------------------------------------------------------------------------------
+## Recommended: Harden the Service
+
+Layer this on once the base unit is confirmed working - gives you a simpler fallback if anything here needs debugging.
+
+**Lock down the scripts** (files before directory - your own shell expands `*.sh` before `sudo` runs):
+
+    sudo chown root:your_username /home/your_username/.scripts/*.sh
+    sudo chmod 750 /home/your_username/.scripts/*.sh
+    sudo chown root:your_username /home/your_username/.scripts
+    sudo chmod 750 /home/your_username/.scripts
+
+> [!Caution]
+> Prevents tampering, not credential exposure - `your_username` can still read `RCON_PASS` via group access.
+
+**Add to `[Service]`:**
+
+    Environment="SCREENDIR=/home/your_username/.screen"
+    ExecStartPre=+/bin/mkdir -p /home/your_username/.screen
+    ExecStartPre=+/bin/chown -R your_username:your_username /home/your_username/.screen
+    ExecStartPre=+/bin/chmod 700 /home/your_username/.screen
+    NoNewPrivileges=true
+    PrivateTmp=true
+    ProtectSystem=strict
+    ProtectHome=read-only
+    ReadWritePaths=/home/your_username/conan_server
+    ReadWritePaths=/home/your_username/.run
+    ReadWritePaths=/home/your_username/.flock
+    ReadWritePaths=-/home/your_username/.screen
+    ReadWritePaths=/home/your_username/.logs
+    ReadWritePaths=/home/your_username/.backups
+    ReadWritePaths=/home/your_username/downloads
+    ReadWritePaths=/home/your_username/.local/share/Steam
+    ReadWritePaths=-/home/your_username/.steam
+
+> [!Important]
+> `+` on `ExecStartPre=` is required - without it, these setup commands run inside the same sandbox as the main process, creating a circular dependency (sandbox needs `.screen` to exist to bind-mount it; nothing outside the sandbox exists yet to create it). Produces `status=217/USER` reproducibly. `+` runs the setup fully unsandboxed first, breaking the cycle. Confirmed working with `ProtectHome=read-only` on a live server.
+
+**Reload and confirm:**
+
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed ConanExiles.service
+    sudo systemctl restart ConanExiles.service
+    sudo systemctl status ConanExiles.service
+    sudo systemd-analyze security ConanExiles.service
 
 --------------------------------------------------------------------------------
 # Step 11: Create the Host-Level Maintenance Script (Optional)
@@ -763,6 +820,8 @@ Reload and restart
     sudo systemctl daemon-reload
     sudo systemctl restart ssh.service
 
+![image](https://github.com/user-attachments/assets/f12f25af-807d-4981-9e53-ebe2ab3d2688)
+
 **Change Who Can Use the Switch User (su) Command**
 
     sudo groupadd restrictedsu
@@ -772,57 +831,10 @@ Add the line:
 
     auth       required   pam_wheel.so group=restrictedsu
 
+![image](https://github.com/user-attachments/assets/3d3c941b-aadd-4bdb-b736-e2fb4c7b5c8b)
+
 > [!TIP]
 > If you want to trigger `start_server.sh`/`stop_server.sh` remotely (e.g. from a control panel or automation tool) without giving that system a general-purpose shell, consider a forced-command SSH key restricted to exactly one script (`command="/home/your_username/.scripts/start_server.sh",restrict ssh-ed25519 ...` in `authorized_keys`) instead of a normal login key. This limits what a leaked key could ever be used for, even in the worst case.
-
-## Lock Down the Operational Scripts
-
-By default, `start_server.sh`, `stop_server.sh`, and `update_checker.sh` are owned by the same user the game process itself runs as. If the running Conan binary or a malicious mod is ever compromised, that account's write access means an attacker could overwrite these scripts - the next time systemd or cron triggers them, your own automation would run the attacker's payload.
-
-    sudo chown root:your_username /home/your_username/.scripts
-    sudo chmod 750 /home/your_username/.scripts
-    sudo chown root:your_username /home/your_username/.scripts/*.sh
-    sudo chmod 750 /home/your_username/.scripts/*.sh
-
-> [!Important]
-> Lock down both the **directory** and the **files**. Locking only the files isn't enough - if the directory itself is still writable, an attacker can delete and recreate a script even without write access to its contents.
-
-> [!Caution]
-> **This protects against tampering, not against credential exposure.** `750` still gives `your_username` group read access - the same account can `cat stop_server.sh` and read `RCON_PASS` in plaintext, since the game process itself needs that same credential to authenticate over RCON. This is somewhat structurally unavoidable in this design: the account running the game inherently must be able to read what it authenticates with. If a compromised game process reading its own RCON password (rather than modifying scripts) is a threat you specifically care about, that needs a different privilege model entirely - e.g. a helper process with access `your_username` lacks - which is real added complexity most homelab setups don't need. This step solves one problem, not both.
-
-## Sandbox the systemd Service
-
-Add the following under `[Service]` in `/etc/systemd/system/ConanExiles.service` (Step 10):
-
-    Environment="SCREENDIR=/home/your_username/.screen"
-    NoNewPrivileges=true
-    PrivateTmp=true
-    ProtectSystem=strict
-    ProtectHome=read-only
-    ReadWritePaths=/home/your_username/conan_server
-    ReadWritePaths=/home/your_username/.run
-    ReadWritePaths=/home/your_username/.flock
-    ReadWritePaths=/home/your_username/.screen
-    ReadWritePaths=/home/your_username/.logs
-    ReadWritePaths=/home/your_username/.backups
-    ReadWritePaths=/home/your_username/downloads
-    ReadWritePaths=/home/your_username/.local/share/Steam
-
-Create the directory and make sure any manual/interactive `screen` sessions use the same location, or `screen -list` won't see sessions started under the unit and vice versa:
-
-    mkdir -p /home/your_username/.screen
-    chmod 700 /home/your_username/.screen
-    export SCREENDIR=/home/your_username/.screen   # add this to your shell profile too
-
-> [!Caution]
-> `ProtectSystem=strict` and `ProtectHome=read-only` make essentially the entire filesystem read-only to this service by default - every path it needs to write to must be listed explicitly, or the write fails silently and something breaks (most likely the SteamCMD update, the Workshop mod download/sync step, or the backup/log/PID-file writes). `/home/your_username/downloads` above is where Workshop mods are staged before being copied into `Mods/` - easy to forget since it's only used mid-script. **`screen`'s own socket directory is the single most likely thing to break on first deploy** if left unaddressed: its default location (often `/run/screen`, distro-dependent) isn't included in this sandbox at all, and `screen -dmS` failing to create its socket fails silently. Pinning `SCREENDIR` explicitly, as done above, removes the guesswork. If you installed SteamCMD differently, confirm its actual cache path too.
-
-**Test before trusting this in production** - reload, restart, and watch a full update-and-mod-sync cycle complete successfully before considering this done:
-
-    sudo systemctl daemon-reload
-    sudo systemctl restart ConanExiles.service
-    sudo journalctl -u ConanExiles.service -f
-    sudo systemd-analyze security ConanExiles.service
 
 --------------------------------------------------------------------------------
 
